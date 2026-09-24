@@ -588,3 +588,80 @@ class RatioAcceptanceResponse(BaseModel):
     groups: List[RatioGroup] = Field(
         description="逐组明细，按逐组序号升序（即包序号与包内顺序）"
     )
+
+
+# ---------------------------------------------------------------------------
+# 仪器预热稳定放行
+# ---------------------------------------------------------------------------
+
+class WarmupReading(BaseModel):
+    """稳定段内的一条读数：候选序号、所属包序号、包内位置与取值。"""
+
+    index: int = Field(
+        description="读数在本次候选序列中的序号（从 1 起，按时间、包序号、包内位置排序）"
+    )
+    seq: int = Field(description="读数所属已提交包序号")
+    position: int = Field(
+        description="读数在该包 measurements 中的原始下标（从 0 起）"
+    )
+    time: datetime = Field(description="有效时间：优先测量 ts，否则包 sent_at，UTC")
+    time_source: Literal["ts", "sent_at"] = Field(
+        description="有效时间来源：测量自身 ts 或包 sent_at"
+    )
+    value: float = Field(description="测量读数（原始值，不应用校准）")
+    unit: Optional[str] = Field(description="测量单位；未提供时为 null")
+
+
+class WarmupStableSegment(BaseModel):
+    """一个满足全部放行条件的连续稳定段。"""
+
+    start_time: datetime = Field(description="稳定段首条读数的有效时间（UTC）")
+    end_time: datetime = Field(description="稳定段末条读数的有效时间（UTC，即完成时间）")
+    duration_seconds: float = Field(
+        ge=0.0, description="首末读数有效时间跨度（秒），不小于最短持续秒数"
+    )
+    reading_count: int = Field(description="段内读数条数，不少于最少读数要求")
+    max_gap_seconds: float = Field(
+        ge=0.0, description="段内最大相邻采样间隔（秒）；单条读数的段为 0"
+    )
+    actual_fluctuation: float = Field(
+        ge=0.0, description="段内读数最大值与最小值之差（实际波动）"
+    )
+    readings: List[WarmupReading] = Field(
+        description="段内读数明细，按有效时间、包序号、包内位置升序"
+    )
+
+
+class WarmupReleaseResponse(BaseModel):
+    """仪器预热稳定放行评估结果。"""
+
+    model_config = {"populate_by_name": True}
+
+    device_id: str
+    metric: str
+    unit: str = Field(description="请求要求的单位；仅单位逐字相符的读数参与")
+    from_: datetime = Field(alias="from", description="评估 UTC 时间范围起点（含）")
+    to: datetime = Field(description="评估 UTC 时间范围终点（不含）")
+    max_fluctuation: float = Field(description="允许的段内最大波动（最大读数减最小读数）")
+    min_duration_seconds: float = Field(description="要求的最短首末时间跨度（秒）")
+    min_readings: int = Field(description="要求的段内最少读数条数")
+    max_gap_seconds: float = Field(description="允许的最大相邻采样间隔（秒）")
+    released: bool = Field(
+        description="放行结论：true=找到合格连续稳定段；false=无合格段，未放行"
+    )
+    not_released_reason: Optional[str] = Field(
+        default=None, description="未放行说明；放行时为 null"
+    )
+    segment: Optional[WarmupStableSegment] = Field(
+        default=None,
+        description="最早完成（同一完成时间取最早起点）的连续稳定段；未放行时为 null",
+    )
+    candidate_count: int = Field(
+        description="时间范围内单位相符、纳入评估的有效读数条数"
+    )
+    excluded_no_time_count: int = Field(
+        description="既无测量 ts 也无包 sent_at、无法定位时间而未参与的同指标读数条数"
+    )
+    excluded_unit_mismatch_count: int = Field(
+        description="时间范围内但单位与请求单位不符（含读数缺单位）而未参与的读数条数"
+    )

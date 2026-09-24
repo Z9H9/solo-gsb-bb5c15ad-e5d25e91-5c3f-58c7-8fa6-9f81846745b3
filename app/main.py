@@ -36,6 +36,7 @@ from .ratio_acceptance import (
     list_acceptances,
 )
 from .rollup import RollupError, compute_rollup
+from .warmup import WarmupError, evaluate_warmup
 from .schemas import (
     AlertEventsResponse,
     AlertEventOut,
@@ -69,6 +70,7 @@ from .schemas import (
     VoidRecordOut,
     VoidResponse,
     VoidsResponse,
+    WarmupReleaseResponse,
 )
 from .voids import (
     VoidConflict,
@@ -346,6 +348,61 @@ def get_metrics_rollup(
                 calibrated,
             )
         except RollupError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get(
+    "/api/v1/devices/{device_id}/metrics/warmup-release",
+    response_model=WarmupReleaseResponse,
+)
+def get_metrics_warmup_release(
+    device_id: str,
+    metric: str = Query(min_length=1, description="指标名，如 temperature"),
+    unit: str = Query(min_length=1, description="要求的读数单位（须逐字相同）"),
+    from_: datetime = Query(alias="from", description="UTC 时间范围起点（含），ISO 8601"),
+    to: datetime = Query(description="UTC 时间范围终点（不含），ISO 8601"),
+    max_fluctuation: float = Query(
+        ge=0, description="稳定段内最大值与最小值之差允许的上限"
+    ),
+    min_duration_seconds: float = Query(
+        ge=0, description="稳定段首末读数时间跨度要求达到的秒数"
+    ),
+    min_readings: int = Query(ge=1, description="稳定段要求的最少读数条数"),
+    max_gap_seconds: float = Query(
+        ge=0, description="稳定段内相邻读数有效时间差允许的上限（秒）"
+    ),
+):
+    """仪器预热稳定放行评估（纯只读，不改写任何已存数据）。
+
+    仅读取已提交包中该指标的测量：有效时间优先取测量 ts，否则取包
+    sent_at，均无的读数不参与；仅保留 [from, to) 内单位与请求 unit
+    逐字相同的读数，按 (时间, 包序号, 包内位置) 排序。在排序后的候选
+    序列上寻找最早完成的连续稳定段：段内最大读数减最小读数不超过
+    max_fluctuation、相邻采样间隔不超过 max_gap_seconds、首末时间跨度
+    达到 min_duration_seconds 且读数不少于 min_readings；同一完成时间
+    取起点最早的段。找到返回放行结论与稳定段起止、读数序号 / 位置及
+    实际波动；无合格段时 released=false 且 segment 为 null。
+    """
+    with db.get_conn() as conn:
+        dev = conn.execute(
+            "SELECT 1 FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        if dev is None:
+            raise HTTPException(status_code=404, detail=f"未知设备: {device_id}")
+        try:
+            return evaluate_warmup(
+                conn,
+                device_id,
+                metric,
+                unit,
+                from_,
+                to,
+                max_fluctuation,
+                min_duration_seconds,
+                min_readings,
+                max_gap_seconds,
+            )
+        except WarmupError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
