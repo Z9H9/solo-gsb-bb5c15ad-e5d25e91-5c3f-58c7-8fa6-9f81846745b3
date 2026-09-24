@@ -12,6 +12,7 @@
 - **只读归档导出**：按设备 + seq 范围创建一次性导出任务，返回 NDJSON 分页游标与 manifest（包数、首尾序号、规范化内容 SHA-256），快照不可变、续传字节稳定，并提供摘要校验接口；导出不触碰提交、缓冲、重复与告警数据。
 - **双设备并行测量比对**：交接班时按设备、指标、UTC 时间段、最大时间偏差与允许数值偏差，只读比对参考仪器与待检仪器已提交包中的同指标读数；测量时间优先取 `ts`、否则取包 `sent_at`，保序一对一配对（先最大化配对数、再最小化时间差总和、平局按配对序号字典序决胜），返回逐对读数差与是否超差及两侧未配对汇总；不改写原始包、缓冲与告警。
 - **双指标配比验收**：为每台设备保存分子 / 分母指标、各自单位、合格比例闭区间与最低有效组数（指标必须不同、下限不大于上限）；按设备 + 序号**闭区间**只读验收已提交包——每个包内两种指标按各自出现顺序**一对一配组、禁止跨包**，缺对应读数、单位不符或分母为零的组标无效并说明原因，有效组比例落在闭区间内才合格；整体须达到最低有效组数且所有有效组合格，返回逐组序号、包内位置、比例与结论；缓冲包与作废序号不参与计算。
+- **仪器预热稳定放行**：按设备、指标、单位与 UTC 时间范围只读读取已提交包读数（测量时间优先 `ts`、否则包 `sent_at`，均无或单位不符的读数不参与），按 (时间, 包序号, 包内位置) 排序；以最大波动、最短持续秒数、最少读数与最大相邻采样间隔为条件，寻找**最早完成的连续稳定段**（同一完成时间取最早起点），返回放行结论、稳定段起止时间、读数序号 / 包序号 / 包内位置与实际波动；不存在合格段时不予放行。
 
 ## 快速开始
 
@@ -91,6 +92,7 @@ pytest tests/
 | POST | `/api/v1/devices/{id}/voids` | 登记缺包作废段（幂等；推进前沿并立即排水提交后续缓冲包） |
 | GET | `/api/v1/devices/{id}/voids` | 按设备分页查询作废登记 |
 | GET | `/api/v1/devices/{id}/metrics/rollup` | 按事件时间的窗口聚合（count/min/max/mean + 水位迟到统计，可选 `calibrated=true` 校准值口径） |
+| GET | `/api/v1/devices/{id}/metrics/warmup-release` | 仪器预热稳定放行：在已提交读数中寻找最早完成的连续稳定段（只读） |
 | POST | `/api/v1/rules` | 创建阈值告警规则（按 设备+指标 唯一） |
 | GET | `/api/v1/rules` | 规则列表（可按 `device_id`/`metric` 过滤） |
 | GET | `/api/v1/rules/{rule_id}` | 规则详情 |
@@ -689,6 +691,71 @@ curl 'localhost:8000/api/v1/devices/ph-meter-01/ratio-acceptance/evaluate?from_s
 未知设备或设备尚无配置 → `404`；区间倒置 / 序号小于 1 → `422`；
 区间内没有任何组时 HTTP 仍为 `200`，`accepted=false`（有效组数 0 未达最低要求）。
 
+## 仪器预热稳定放行（Warmup Release）
+
+仪器开机预热后，需要确认读数在一段时间内足够平稳才可放行使用。接口
+`GET /api/v1/devices/{device_id}/metrics/warmup-release` 是**纯只读**的：
+仅查询该设备 `committed` 表中已提交包的原始 payload，不写入任何数据，
+也不改写原始包、缓冲、重复、作废、告警与校准。
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `metric` | 是 | 指标名，只取该指标的测量 |
+| `unit` | 是 | 要求的读数单位（非空字符串，读数单位须逐字相同；读数缺单位视为不符） |
+| `from` / `to` | 是 | UTC 时间范围，半开区间 `[from, to)`，ISO 8601（不带时区按 UTC） |
+| `max_fluctuation` | 是 | 稳定段允许的最大波动：段内最大读数 - 最小读数**不超过**该值（边界合格），`>= 0` |
+| `min_duration_seconds` | 是 | 稳定段首末读数有效时间跨度至少达到的秒数，`> 0`（边界合格） |
+| `min_readings` | 是 | 稳定段至少包含的读数条数，`>= 1`（边界合格） |
+| `max_gap_seconds` | 是 | 稳定段内相邻两条读数的最大允许采样间隔（秒），`>= 0`（边界合格） |
+
+候选读数与排序：
+
+- 每条测量的有效时间**优先取自身 `ts`，否则取所属包的 `sent_at`**；
+  两者都没有的测量**不参与**（计入 `excluded_no_time_count`）；
+- 仅保留有效时间落在 `[from, to)` 内、且单位与 `unit` 逐字相同的测量；
+  单位不符（含未填单位）的读数**不参与**（计入
+  `excluded_unit_mismatch_count`，时间范围外的读数不计入该计数）；
+- 候选按 **(有效时间, 包序号 seq, 包内位置 position)** 升序排序，
+  缓冲区中尚未提交的包不参与。
+
+稳定段判定：在候选序列上寻找一段**连续**读数，同时满足
+
+1. 段内最大值与最小值之差（`fluctuation`）**不超过** `max_fluctuation`；
+2. 段内任意相邻读数的有效时间差**不超过** `max_gap_seconds`——相邻间隔
+   超限处序列视为断裂，稳定段**不得跨断裂**；
+3. 首末读数的时间跨度**达到** `min_duration_seconds`；
+4. 段内读数条数**不少于** `min_readings`。
+
+服务端返回**最早完成**（完成时间 = 段末读数的有效时间）的合格段；
+同一完成时间存在多段时取**起点最早**的一段（即该完成时刻可行的最长段）。
+没有任何合格段时 HTTP 仍为 `200`，`released=false`、`segment=null` 并给出
+`not_released_reason`。未知设备 → `404`；时间范围倒置、阈值为负、
+`min_duration_seconds <= 0`、`min_readings < 1`、缺参数等 → `422`。
+
+```bash
+curl 'localhost:8000/api/v1/devices/oven-7/metrics/warmup-release?metric=temperature&unit=C&from=2026-09-24T08:00:00Z&to=2026-09-24T09:00:00Z&max_fluctuation=0.5&min_duration_seconds=20&min_readings=3&max_gap_seconds=15'
+# => 200
+# {"device_id":"oven-7","metric":"temperature","unit":"C",
+#  "from":"2026-09-24T08:00:00Z","to":"2026-09-24T09:00:00Z",
+#  "max_fluctuation":0.5,"min_duration_seconds":20.0,"min_readings":3,
+#  "max_gap_seconds":15.0,
+#  "candidate_count":4,"excluded_no_time_count":1,
+#  "excluded_unit_mismatch_count":1,"released":true,
+#  "segment":{"start_time":"2026-09-24T08:00:00Z",
+#             "end_time":"2026-09-24T08:00:20Z","duration_seconds":20.0,
+#             "reading_count":3,"min_value":20.0,"max_value":20.2,
+#             "fluctuation":0.2,"max_adjacent_gap_seconds":10.0,
+#             "readings":[{"index":1,"seq":1,"position":0,
+#                          "time":"2026-09-24T08:00:00Z","time_source":"ts",
+#                          "value":20.0,"unit":"C"}, ...]},
+#  "not_released_reason":null}
+```
+
+段内每条读数给出段内序号 `index`（从 1 起）、所属包序号 `seq`、
+包内原始下标 `position`、有效时间与来源（`ts` / `sent_at`）、读数与单位；
+段上的 `fluctuation` 为实际波动（最大 - 最小），
+`max_adjacent_gap_seconds` 为段内实际最大相邻采样间隔。
+
 ## 项目结构
 
 ```
@@ -702,6 +769,7 @@ app/
   exports.py      # 只读归档导出：不可变快照、NDJSON 游标编解码、manifest 摘要校验（范围含作废段时 complete=false）
   comparisons.py  # 双设备同指标并行测量比对：候选时间排序、保序二分匹配（配对数>时间差总和>字典序）
   ratio_acceptance.py # 双指标配比验收：配置表、包内一对一配组（禁跨包）、无效原因与闭区间合格判定
+  warmup.py       # 仪器预热稳定放行：候选读数过滤排序、单调队列寻找最早完成的连续稳定段
   db.py           # SQLite 连接与建表（启动时自动执行）
   schemas.py      # Pydantic 模型
 tests/
@@ -714,6 +782,7 @@ tests/
   test_exports.py       # 归档导出 / 游标 / 摘要校验测试
   test_comparisons.py   # 双设备并行测量比对测试（排序 / 保序匹配 / 决胜 / 200 上限 / 只读）
   test_ratio_acceptance.py # 双指标配比验收测试（配置校验 / 包内配组 / 无效原因 / 闭区间 / 缓冲作废排除 / 只读）
+  test_warmup.py        # 仪器预热稳定放行测试（ts 回退 / 单位与无时间排除 / 波动间隔时长读数约束 / 最早完成与最早起点 / 只读）
 Dockerfile / docker-entrypoint.sh / docker-compose.yml
 requirements.txt / requirements-dev.txt
 ```

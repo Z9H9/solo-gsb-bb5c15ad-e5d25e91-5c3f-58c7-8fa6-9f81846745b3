@@ -69,6 +69,7 @@ from .schemas import (
     VoidRecordOut,
     VoidResponse,
     VoidsResponse,
+    WarmupReleaseResponse,
 )
 from .voids import (
     VoidConflict,
@@ -77,6 +78,7 @@ from .voids import (
     void_missing,
     voided_count,
 )
+from .warmup import WarmupError, evaluate_warmup_release
 
 
 @asynccontextmanager
@@ -346,6 +348,64 @@ def get_metrics_rollup(
                 calibrated,
             )
         except RollupError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# 仪器预热稳定放行
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/api/v1/devices/{device_id}/metrics/warmup-release",
+    response_model=WarmupReleaseResponse,
+)
+def get_warmup_release(
+    device_id: str,
+    metric: str = Query(min_length=1, description="指标名，如 temperature"),
+    unit: str = Query(min_length=1, description="要求的读数单位（读数须逐字相同，缺单位视为不符）"),
+    from_: datetime = Query(alias="from", description="UTC 时间范围起点（含），ISO 8601"),
+    to: datetime = Query(description="UTC 时间范围终点（不含），ISO 8601"),
+    max_fluctuation: float = Query(
+        ge=0, description="稳定段允许的最大波动：段内最大读数 - 最小读数不得超过该值"
+    ),
+    min_duration_seconds: float = Query(
+        gt=0, description="稳定段首末读数时间跨度至少达到的秒数"
+    ),
+    min_readings: int = Query(ge=1, description="稳定段至少包含的读数条数"),
+    max_gap_seconds: float = Query(
+        ge=0, description="稳定段内相邻两次采样的最大允许间隔（秒）"
+    ),
+):
+    """仪器预热稳定放行判定（纯只读，不改写任何已存数据）。
+
+    仅查询该设备已提交包中的同指标测量：每条测量优先用 ts，否则用包
+    sent_at，均无则忽略；按 (时间, 包序号, 包内位置) 排序。单位须与
+    请求 unit 逐字相同（缺单位视为不符，不参与）。寻找最早完成的连续
+    稳定段：段内最大值与最小值之差不超过 max_fluctuation、相邻采样
+    间隔不超过 max_gap_seconds、首末时间跨度达到 min_duration_seconds
+    且读数不少于 min_readings；同一完成时间取最早起点。无合格段时
+    released=false 且 segment 为 null。
+    """
+    with db.get_conn() as conn:
+        dev = conn.execute(
+            "SELECT 1 FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        if dev is None:
+            raise HTTPException(status_code=404, detail=f"未知设备: {device_id}")
+        try:
+            return evaluate_warmup_release(
+                conn,
+                device_id,
+                metric,
+                unit,
+                from_,
+                to,
+                max_fluctuation,
+                min_duration_seconds,
+                min_readings,
+                max_gap_seconds,
+            )
+        except WarmupError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
